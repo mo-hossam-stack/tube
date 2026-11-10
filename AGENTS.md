@@ -10,7 +10,7 @@ make run                                   # installs/builds what is missing, se
 make run ARGS="--port 9000 --no-browser"   # extra CLI flags
 make install                               # backend uv sync + frontend npm ci
 make build                                 # production frontend build
-make test                                  # pytest + ruff
+make test                                  # pytest + ruff + frontend Vitest
 make lint                                  # ruff + tsc
 make clean                                 # remove frontend/dist and caches
 ```
@@ -34,22 +34,25 @@ backend/app/
   main.py            create_app() factory: lifespan wiring, middleware, routers, SPA serving
   cli.py             argparse + uvicorn entry point (`vid-dwn` script)
   core/              config (pydantic-settings), errors, logging, security
-  api/routes/        videos, downloads, settings, system, media, ws
+  api/routes/        videos, downloads, collections, settings, system, media, ws
   domain/            pure logic: enums, formats/presets, naming templates, progress parsing,
-                     state transitions, URL validation (SSRF guard)
-  services/          download_manager (workers/queue), runner (subprocess), extractor,
-                     events (EventBus), settings, storage (path containment)
+                     state transitions, URL validation (SSRF guard), flat playlist/channel
+                     listing parsing (collections)
+  services/          download_manager (workers/queue), runner (subprocess), extractor
+                     (probe: video or collection), collections (queue a playlist as items),
+                     job_spec (shared job options), events (EventBus), settings, storage
   integrations/      ytdlp binary probing and invocation
-  db/                SQLAlchemy async engine, tables, repositories
+  db/                SQLAlchemy async engine, tables, repositories, migrations
   schemas/           Pydantic request/response models
   tests/             pytest; fake yt-dlp in tests/fakes/yt-dlp
 frontend/src/
   api/client.ts      fetch wrapper, token handling, typed methods
   api/types.ts       generated from OpenAPI — do not edit by hand
   api/queries.ts     react-query hooks
-  components/        ui primitives + downloads/video/layout components
+  components/        ui primitives + downloads/video/collection/layout components
   pages/             Home, Downloads, Settings
-  realtime/          WebSocket provider
+  realtime/          WebSocket provider; cache.ts routes live events into cached lists
+  test/              Vitest setup, typed fixtures, render helper
 ```
 
 ## Backend conventions
@@ -65,6 +68,12 @@ frontend/src/
   progress through `EventBus`; WebSocket clients authenticate with a first message, never
   a query string.
 - Persist through repositories in `app/db/repos.py`; tables live in `app/db/tables.py`.
+- Schema changes are a new numbered step in `app/db/migrations.py` with frozen DDL; never
+  edit a released step. Fresh databases come from the models, so a step must leave the
+  same schema as `create_all` (`tests/test_migrations.py` compares the two).
+- Status is only written through `DownloadRepo.transition`, a compare-and-set. Writes made
+  by a worker's run pass `run_attempt`, so a run superseded by a retry cannot touch the
+  new attempt.
 - Keep tests offline: they use `backend/tests/fakes/yt-dlp` and a fake FFmpeg path. Add a
   test for any new branch, parser, state transition, or security check.
 
@@ -87,6 +96,8 @@ frontend/src/
   update `src/api/types.ts` with `npm run gen:api` against a running server.
 - Reuse the primitives in `src/components/ui` and the existing page/section structure
   instead of new ad-hoc styles.
+- Tests are Vitest + Testing Library (`src/**/*.test.ts[x]`, `npm test`). Keep logic in
+  pure modules where possible and use the typed fixtures in `src/test/fixtures.ts`.
 
 ## Gotchas
 
@@ -95,3 +106,6 @@ frontend/src/
   changes.
 - One SQLite database lives under `VID_DWN_DATA_DIR` (`vid-dwn.sqlite3`); recovery of
   interrupted jobs runs at startup.
+- Playlist and channel items are ordinary download rows with a `collection_id`. They are
+  queued from a flat listing and resolve their formats when they run (`revalidate=True`),
+  so the client only ever sends entry ids, never entry URLs.

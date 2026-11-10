@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 from app.db.engine import init_db, make_engine, make_sessionmaker
-from app.db.repos import CollectionRepo, DownloadRepo
+from app.db.repos import CollectionRepo, DownloadRepo, StaleRun
 from app.domain.enums import Event, Status
 from app.domain.state import InvalidTransition
 
@@ -183,3 +183,22 @@ async def test_transition_still_rejects_invalid_moves(repos):
         await downloads.transition("done", Event.CANCEL)
     with pytest.raises(KeyError):
         await downloads.transition("missing", Event.CANCEL)
+
+
+async def test_a_superseded_run_can_no_longer_change_the_job(repos):
+    downloads, _ = repos
+    await downloads.create(**_item("job", 1, Status.EXTRACTING, attempts=0))
+    await downloads.transition("job", Event.CANCEL)
+    await downloads.transition("job", Event.RETRY, attempts=1)  # now queued, attempt 1
+
+    # The canceled attempt-0 run finishing its extraction: spawn would be valid from queued.
+    with pytest.raises(StaleRun):
+        await downloads.transition("job", Event.SPAWN, run_attempt=0)
+    await downloads.update_progress("job", run_attempt=0, progress=55.0)
+
+    row = await downloads.get("job")
+    assert (row.status, row.progress) == (Status.QUEUED.value, 0.0)
+    # The current attempt is unaffected.
+    await downloads.update_progress("job", run_attempt=1, progress=10.0)
+    assert (await downloads.transition("job", Event.SPAWN, run_attempt=1)).status == "downloading"
+    assert (await downloads.get("job")).progress == 10.0

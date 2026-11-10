@@ -243,6 +243,40 @@ async def test_stop_without_start_is_a_no_op(harness):
     assert manager.workers == []
 
 
+async def test_retry_during_a_canceled_runs_extraction_is_not_hijacked(
+    harness, media_roots, fake_env
+):
+    """Cancel while extracting, then retry before the old run has wound down.
+
+    The old run must neither drive the new attempt (spawn is valid from queued) nor
+    swallow its queue entry; the retried job runs exactly once and completes.
+    """
+    fake_env.setenv("FAKE_PROBE_DELAY", "1")
+    repo, manager, runner = harness
+    manager.config = manager.config.model_copy(update={"max_concurrent_downloads": 1})
+    job_id = await _queued_job(repo, media_roots / "Videos" / "Tube", **_deferred())
+    await manager.start()
+    await manager.enqueue(job_id)
+    for _ in range(200):
+        if (await repo.get(job_id)).status == Status.EXTRACTING.value:
+            break
+        await asyncio.sleep(0.02)
+
+    await manager.cancel(job_id)
+    assert (await repo.get(job_id)).status == Status.CANCELED.value
+    await manager.retry(job_id)  # the canceled run is still extracting
+    fake_env.setenv("FAKE_PROBE_DELAY", "0")
+
+    for _ in range(400):
+        row = await repo.get(job_id)
+        if row.status not in {s.value for s in ACTIVE_STATUSES}:
+            break
+        await asyncio.sleep(0.05)
+    assert row.status == Status.COMPLETED.value, (row.status, row.error_code)
+    assert row.attempts == 1
+    assert runner.starts == [job_id]
+
+
 async def test_retry_revalidates_with_the_jobs_browser_cookies(
     harness, media_roots, fake_env, tmp_path
 ):

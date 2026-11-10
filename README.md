@@ -9,6 +9,9 @@ account, no cloud and no telemetry.
 - Linux
 - Python 3.12+ and [uv](https://docs.astral.sh/uv/)
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) and FFmpeg on `PATH`
+- Recommended for YouTube: [Deno](https://deno.com/). Recent yt-dlp needs a JavaScript
+  runtime for full YouTube support; without one some formats are missing and downloads
+  can be throttled ([details](https://github.com/yt-dlp/yt-dlp/wiki/EJS))
 - Node.js only if you want to rebuild the frontend
 
 ```bash
@@ -42,6 +45,13 @@ Configuration comes from environment variables or a `.env` file in the repo root
 - Server-side format resolution: presets are matched against the streams a video really
   has, then merged into a compatible container (no silent re-encoding)
 - Video, audio-only (MP3/M4A/Opus/FLAC/WAV) and optional subtitles
+- Playlists and channels: paste a playlist or channel link, pick the videos you want and
+  queue them as one group. Each video is downloaded as its own job (formats are resolved
+  per video), into a folder named after the playlist by default; videos you already have
+  are skipped unless you ask otherwise. A channel's sections (Videos, Shorts, ...) can be
+  opened individually, and a whole group can be canceled, retried or removed at once.
+  Listings are capped at 500 entries (`VID_DWN_MAX_COLLECTION_ENTRIES`). Add
+  `%(playlist_index)s` to the filename template to number the files in playlist order.
 - Live queue progress over one local WebSocket: speed, ETA, cancel, retry
 - Resume: canceled or crashed downloads keep their partial file; retry continues it
 - Verification: a job is only marked completed when the output file exists inside the
@@ -69,7 +79,7 @@ to be exposed through a reverse proxy or to other machines.
 ## Development
 
 ```bash
-make test      # pytest + ruff
+make test      # pytest + ruff + frontend tests (Vitest)
 make lint      # ruff + tsc
 make build     # production frontend build
 ```
@@ -83,7 +93,8 @@ Makefile    install/build/run; rebuilds the frontend when it is stale
 ```
 
 Backend tests use a fake `yt-dlp` (`backend/tests/fakes/yt-dlp`) so no network or media
-tooling is needed. Run the app against a scratch data dir with:
+tooling is needed. Frontend tests run under jsdom with Testing Library (`cd frontend &&
+npm test`, or `npm run test:watch`). Run the app against a scratch data dir with:
 
 ```bash
 VID_DWN_DATA_DIR=/tmp/vid-dwn \

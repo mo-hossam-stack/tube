@@ -19,6 +19,7 @@ for arg in "$@"; do
 done
 
 if [ "$probe" = "1" ]; then
+  sleep "${FAKE_PROBE_DELAY:-0}"
   # Mirror yt-dlp's routing: channels and playlists come back as listings, and a link
   # naming both a video and a playlist is the video unless --yes-playlist is given.
   case "$url" in

@@ -40,6 +40,8 @@ class JobRuntime:
     last_event: float = 0.0
     last_fields: dict = field(default_factory=dict)
     done: asyncio.Event = field(default_factory=asyncio.Event)
+    attempt: int | None = None  # the job's ``attempts`` when this run claimed it
+    requeue: bool = False  # the job was queued again while this run was still going
 
 
 class DownloadManager:
@@ -249,8 +251,11 @@ class DownloadManager:
     async def _run(self, download_id: str) -> None:
         # A job id can sit in the queue more than once (e.g. canceled while queued, then
         # retried). Checking and registering without an await in between keeps a second
-        # worker from starting it while the first one is still running.
-        if download_id in self.runtimes:
+        # worker from starting it while the first one is still running. The entry is not
+        # dropped: if the job was retried meanwhile, it runs once the current run exits.
+        existing = self.runtimes.get(download_id)
+        if existing is not None:
+            existing.requeue = True
             return
         runtime = JobRuntime()
         self.runtimes[download_id] = runtime
@@ -268,6 +273,7 @@ class DownloadManager:
                 )
             if claimed is None:
                 return  # canceled or claimed elsewhere since it was queued
+            runtime.attempt = claimed.attempts
             if claimed.collection_id:
                 await self._collection_changed(claimed.collection_id)
             current = Status(claimed.status)
@@ -311,6 +317,7 @@ class DownloadManager:
                 row = await self.repo.transition(
                     download_id,
                     Event.SPAWN,
+                    run_attempt=runtime.attempt,
                     job_spec=spec,
                     format_selector=resolved.selector,
                     format_label=resolved.label,
@@ -342,6 +349,7 @@ class DownloadManager:
             runtime.handle = handle
             await self.repo.update_progress(
                 download_id,
+                run_attempt=runtime.attempt,
                 pid=handle.pid,
                 pid_started_ticks=getattr(handle, "pid_started_ticks", None),
             )
@@ -354,6 +362,9 @@ class DownloadManager:
             if runtime.handle:
                 await kill_process_group(runtime.handle.pid, grace=1.0)
             raise
+        except InvalidTransition as exc:
+            # The job moved on without this run: canceled, or retried as a new attempt.
+            log.info("run of %s ended early: %s", download_id, exc)
         except AppError as exc:
             await self._fail(download_id, exc.code, exc.message, runtime)
         except Exception as exc:
@@ -362,6 +373,8 @@ class DownloadManager:
         finally:
             self.runtimes.pop(download_id, None)
             runtime.done.set()
+            if runtime.requeue and not self._stopping:
+                await self.enqueue(download_id)
 
     async def _consume_stdout(
         self, download_id: str, runtime: JobRuntime, handle: RunHandle, current: Status
@@ -380,7 +393,10 @@ class DownloadManager:
             if parsed.kind == "dest" and parsed.path:
                 runtime.temp_path = parsed.path
                 await self.repo.update_progress(
-                    download_id, temp_path=parsed.path, resumable=True
+                    download_id,
+                    run_attempt=runtime.attempt,
+                    temp_path=parsed.path,
+                    resumable=True,
                 )
             elif parsed.kind == "final" and parsed.path:
                 runtime.final_path = parsed.path
@@ -393,6 +409,7 @@ class DownloadManager:
                         row = await self.repo.transition(
                             download_id, Event.POSTPROCESS, progress=100.0,
                             speed=None, eta_s=None, total_bytes=update.total_bytes,
+                            run_attempt=runtime.attempt,
                         )
                         await self._broadcast(row)
                     except InvalidTransition:
@@ -400,7 +417,9 @@ class DownloadManager:
                     current = Status.PROCESSING
                 if now - runtime.last_flush >= 1.0:
                     runtime.last_flush = now
-                    await self.repo.update_progress(download_id, **fields)
+                    await self.repo.update_progress(
+                        download_id, run_attempt=runtime.attempt, **fields
+                    )
                 if now - runtime.last_event >= 0.35:
                     runtime.last_event = now
                     row = await self.repo.get(download_id)
@@ -427,11 +446,11 @@ class DownloadManager:
         current = Status(row.status) if row else Status.DOWNLOADING
         if current == Status.DOWNLOADING:
             try:
-                await self.repo.transition(download_id, Event.VERIFY)
+                await self.repo.transition(download_id, Event.VERIFY, run_attempt=runtime.attempt)
             except InvalidTransition:
                 pass
         elif current == Status.PROCESSING:
-            await self.repo.transition(download_id, Event.VERIFY)
+            await self.repo.transition(download_id, Event.VERIFY, run_attempt=runtime.attempt)
 
         final_path = runtime.final_path or handle.final_path or runtime.temp_path
         spec = (row.job_spec or {}) if row else {}
@@ -461,6 +480,7 @@ class DownloadManager:
         row = await self.repo.transition(
             download_id,
             Event.VERIFIED,
+            run_attempt=runtime.attempt,
             output_path=str(verified),
             file_size=size,
             progress=100.0,
@@ -485,6 +505,7 @@ class DownloadManager:
             row = await self.repo.transition(
                 download_id,
                 Event.CANCEL,
+                run_attempt=runtime.attempt,
                 finished_at=utcnow(),
                 speed=None,
                 eta_s=None,
@@ -505,10 +526,13 @@ class DownloadManager:
         runtime: JobRuntime,
         log_tail: str | None = None,
     ) -> None:
+        if runtime.attempt is None:
+            return  # this run never claimed the job, so it is not this run's to fail
         try:
             row = await self.repo.transition(
                 download_id,
                 Event.FAIL,
+                run_attempt=runtime.attempt,
                 error_code=code,
                 error_message=redact(message)[:500],
                 log_tail=(log_tail or "")[:8000] or None,

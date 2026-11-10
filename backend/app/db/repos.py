@@ -8,10 +8,17 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.db.tables import CollectionRow, DownloadRow, SettingsRow, utcnow
 from app.domain.enums import ACTIVE_STATUSES, Event, Status
-from app.domain.state import apply
+from app.domain.state import InvalidTransition, apply
 
 # Each retry means another transition committed in between; a handful is plenty.
 _TRANSITION_ATTEMPTS = 8
+
+
+class StaleRun(InvalidTransition):
+    """A worker's run tried to change a job that has been retried since it started."""
+
+    def __str__(self) -> str:
+        return f"run superseded by a retry ({self.event.value} while {self.current.value})"
 
 
 def _filter_downloads(
@@ -76,28 +83,46 @@ class DownloadRepo:
         async with self.sessions() as session:
             return list((await session.execute(stmt)).scalars().all())
 
-    async def transition(self, download_id: str, event: Event, **fields: Any) -> DownloadRow:
+    async def transition(
+        self,
+        download_id: str,
+        event: Event,
+        run_attempt: int | None = None,
+        **fields: Any,
+    ) -> DownloadRow:
         """The only place status is written. Status and fields commit together.
 
         Compare-and-set: the update only applies if the status is still the one the
         transition was checked against. If a concurrent transition got there first, the
         event is re-checked against the new status, so e.g. a spawn can never overwrite a
         cancel that landed in between (it raises InvalidTransition instead).
+
+        A worker passes ``run_attempt`` (the job's ``attempts`` when it claimed it): once
+        the job has been retried, that run can no longer change it and gets StaleRun.
         """
         for _ in range(_TRANSITION_ATTEMPTS):
             async with self.sessions() as session:
-                current = (
+                found = (
                     await session.execute(
-                        select(DownloadRow.status).where(DownloadRow.id == download_id)
+                        select(DownloadRow.status, DownloadRow.attempts).where(
+                            DownloadRow.id == download_id
+                        )
                     )
-                ).scalar_one_or_none()
-            if current is None:
+                ).one_or_none()
+            if found is None:
                 raise KeyError(download_id)
+            current, attempts = found
+            if run_attempt is not None and attempts != run_attempt:
+                raise StaleRun(Status(current), event)
             target = apply(Status(current), event).value
             async with self.sessions.begin() as session:
                 result = await session.execute(
                     update(DownloadRow)
-                    .where(DownloadRow.id == download_id, DownloadRow.status == current)
+                    .where(
+                        DownloadRow.id == download_id,
+                        DownloadRow.status == current,
+                        DownloadRow.attempts == attempts,
+                    )
                     .values(status=target, **fields)
                 )
                 if result.rowcount == 1:
@@ -121,13 +146,15 @@ class DownloadRepo:
                 return None
             return await session.get(DownloadRow, download_id)
 
-    async def update_progress(self, download_id: str, **fields: Any) -> None:
+    async def update_progress(
+        self, download_id: str, run_attempt: int | None = None, **fields: Any
+    ) -> None:
+        """Write non-status fields; a superseded run's writes (see transition) are dropped."""
+        stmt = update(DownloadRow).where(DownloadRow.id == download_id)
+        if run_attempt is not None:
+            stmt = stmt.where(DownloadRow.attempts == run_attempt)
         async with self.sessions.begin() as session:
-            row = await session.get(DownloadRow, download_id)
-            if row is None:
-                return
-            for key, value in fields.items():
-                setattr(row, key, value)
+            await session.execute(stmt.values(**fields))
 
     async def delete(self, download_id: str) -> None:
         async with self.sessions.begin() as session:
